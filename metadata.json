@@ -1,0 +1,6 @@
+{
+  "name": "epicpaper",
+  "description": "Extracts publication date, authors, and other metadata from a list of DOIs or paper titles using the Crossref API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
