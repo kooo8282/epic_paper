@@ -1,5 +1,6 @@
 import React, { useState, useCallback } from 'react';
-import { Search, Download, Trash2, FileText, CheckCircle2, XCircle, Loader2, AlertCircle, Key } from 'lucide-react';
+import { Search, Download, Trash2, FileText, CheckCircle2, XCircle, Loader2, AlertCircle, Key, Settings } from 'lucide-react';
+import * as xlsx from 'xlsx';
 
 interface PaperInfo {
   id: string; // Original input or Scopus ID
@@ -11,6 +12,9 @@ interface PaperInfo {
   doi: string;
   status: 'pending' | 'success' | 'error' | 'not_found';
   errorMsg?: string;
+  issns?: string[];
+  topPercentile?: number;
+  topSubjectArea?: string;
 }
 
 const isDOI = (str: string) => {
@@ -26,8 +30,181 @@ const cleanText = (str: string) => {
   return doc.documentElement.textContent || "";
 };
 
+let jcrCache: { url: string; data: Record<string, { percentile: number; category: string }> } | null = null;
+
+const loadJCRData = async (url: string) => {
+  if (jcrCache && jcrCache.url === url) return jcrCache.data;
+  
+  const res = await fetch("/api/proxy-jcr", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url })
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to load JCR data (${res.status}): ${res.statusText}`);
+  }
+  const buffer = await res.arrayBuffer();
+  const workbook = xlsx.read(buffer, { type: 'buffer' });
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const data = xlsx.utils.sheet_to_json<any[]>(sheet, { header: 1 });
+  
+  const map: Record<string, { percentile: number; category: string }> = {};
+  
+  // Find column indices by header if possible, else default to 9,10,11,17
+  let catIdx = 9;
+  let issnIdx = 10;
+  let eissnIdx = 11;
+  let jifRankIdx = 17;
+  
+  const headRow = data[0];
+  if (Array.isArray(headRow)) {
+    const cIdx = headRow.findIndex(h => h === 'Category');
+    if (cIdx >= 0) catIdx = cIdx;
+    const iIdx = headRow.findIndex(h => h === 'ISSN');
+    if (iIdx >= 0) issnIdx = iIdx;
+    const eiIdx = headRow.findIndex(h => h === 'eISSN');
+    if (eiIdx >= 0) eissnIdx = eiIdx;
+    const jIdx = headRow.findIndex(h => h === 'JIF Rank');
+    if (jIdx >= 0) jifRankIdx = jIdx;
+  }
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row || row.length < 1) continue;
+    
+    const catStr = row[catIdx] as string;
+    const jifRankStr = row[jifRankIdx] as string;
+    
+    const issnStr = row[issnIdx] ? String(row[issnIdx]) : '';
+    const eissnStr = row[eissnIdx] ? String(row[eissnIdx]) : '';
+    const issn = issnStr.replace(/-/g, '').toUpperCase();
+    const eissn = eissnStr.replace(/-/g, '').toUpperCase();
+    
+    let bestPercentile = 100;
+    let bestCategoryTitle = '';
+    
+    const catGroups = catStr && typeof catStr === 'string' ? catStr.split(';') : [];
+    const rankGroups = jifRankStr && typeof jifRankStr === 'string' ? jifRankStr.split(';') : [];
+    
+    // We expect catGroups and rankGroups to be parallel, but we can also just compute all percentiles
+    // and take the best.
+    for (let cIdx = 0; cIdx < catGroups.length; cIdx++) {
+      const gStr = catGroups[cIdx].trim();
+      if (!gStr) continue;
+      
+      const parts = gStr.split('|');
+      const cTitle = parts.length > 0 ? parts[0].trim() : gStr.trim();
+      let p = 100;
+      
+      // Try to parse from JIF Rank column first
+      if (cIdx < rankGroups.length) {
+        const rg = rankGroups[cIdx].trim();
+        if (rg && rg.includes('/')) {
+           const rp = rg.split('/');
+           if (rp.length === 2) {
+              const r = parseInt(rp[0].trim(), 10);
+              const t = parseInt(rp[1].trim(), 10);
+              if (!isNaN(r) && !isNaN(t) && t > 0) {
+                 p = (r / t) * 100;
+              }
+           }
+        }
+      }
+      
+      // If p is still 100, try to parse from Category format (third part)
+      if (p === 100 && parts.length >= 3) {
+        const rp = parts[2].split('/');
+        if (rp.length === 2) {
+          const r = parseInt(rp[0].trim(), 10);
+          const t = parseInt(rp[1].trim(), 10);
+          if (!isNaN(r) && !isNaN(t) && t > 0) {
+             p = (r / t) * 100;
+          }
+        }
+      }
+      
+      if (p < bestPercentile) {
+        bestPercentile = p;
+        bestCategoryTitle = cTitle;
+      }
+    }
+    
+    // Fallback if formatting was strange but there's a jifRankStr that doesn't align with categories
+    if (bestPercentile === 100 && jifRankStr && typeof jifRankStr === 'string') {
+        const rankSplits = jifRankStr.split(';');
+        for (const rg of rankSplits) {
+          const rgt = rg.trim();
+          if (rgt.includes('/')) {
+             const rp = rgt.split('/');
+             if (rp.length === 2) {
+                const r = parseInt(rp[0].trim(), 10);
+                const t = parseInt(rp[1].trim(), 10);
+                if (!isNaN(r) && !isNaN(t) && t > 0) {
+                   const p = (r / t) * 100;
+                   if (p < bestPercentile) bestPercentile = p;
+                }
+             }
+          }
+        }
+    }
+    
+    // If we only have categoryTitle but couldn't parse percentile
+    if (!bestCategoryTitle && catGroups.length > 0) {
+       bestCategoryTitle = catGroups[0].split('|')[0].trim();
+    }
+    
+    const tryBind = (code: string) => {
+      if (!code || code === 'N/A') return;
+      if (!map[code] || map[code].percentile > bestPercentile) {
+        map[code] = { percentile: bestPercentile, category: bestCategoryTitle };
+      }
+    };
+    
+    tryBind(issn);
+    tryBind(eissn);
+  }
+  
+  jcrCache = { url, data: map };
+  return map;
+};
+
+const fetchJournalPercentiles = async (papers: PaperInfo[], jcrUrl: string): Promise<PaperInfo[]> => {
+  try {
+    const map = await loadJCRData(jcrUrl);
+    return papers.map(p => {
+      let bestPercentile = 100;
+      let bestCategory = '';
+      let found = false;
+      
+      if (p.issns) {
+        for (const issn of p.issns) {
+          const clean = issn.replace(/-/g, '').toUpperCase();
+          if (map[clean] && map[clean].percentile < bestPercentile) {
+            bestPercentile = map[clean].percentile;
+            bestCategory = map[clean].category;
+            found = true;
+          }
+        }
+      }
+      
+      if (found) {
+        return { 
+          ...p, 
+          topPercentile: bestPercentile,
+          topSubjectArea: bestCategory
+        };
+      }
+      return p;
+    });
+  } catch (err) {
+    console.error("Failed to load JCR data:", err);
+    return papers;
+  }
+};
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'crossref' | 'scopus'>('scopus');
+  const [activeTab, setActiveTab] = useState<'crossref' | 'scopus' | 'settings'>('scopus');
   
   // Crossref State
   const [inputText, setInputText] = useState('');
@@ -37,6 +214,31 @@ export default function App() {
   const [fundingNumber, setFundingNumber] = useState(() => localStorage.getItem('savedFundingNumber') || '');
   const [startMonth, setStartMonth] = useState('');
   const [endMonth, setEndMonth] = useState('');
+
+  // Settings State
+  const [jcrUrl, setJcrUrl] = useState(() => localStorage.getItem('savedJcrUrl') || 'https://pub-204bf897281b4764977b8ab503859be6.r2.dev/2025%20JCR%20IMPACTFACTORS%20with%20JIF%20Quartiles.xlsx');
+  const [jcrUrlStatus, setJcrUrlStatus] = useState<'idle' | 'checking' | 'success' | 'error'>('idle');
+  const [jcrUrlMessage, setJcrUrlMessage] = useState('');
+  
+  const testJcrUrl = async () => {
+    if (!jcrUrl) return;
+    setJcrUrlStatus('checking');
+    setJcrUrlMessage('');
+    try {
+      const map = await loadJCRData(jcrUrl);
+      const count = Object.keys(map).length;
+      if (count > 0) {
+        setJcrUrlStatus('success');
+        setJcrUrlMessage(`Successfully loaded ${count.toLocaleString()} journals.`);
+      } else {
+        setJcrUrlStatus('error');
+        setJcrUrlMessage('Loaded file, but found no valid journal entries.');
+      }
+    } catch (err: any) {
+      setJcrUrlStatus('error');
+      setJcrUrlMessage(err.message || 'Failed to load JCR data');
+    }
+  };
   
   // Shared State
   const [results, setResults] = useState<PaperInfo[]>([]);
@@ -119,7 +321,8 @@ export default function App() {
               date,
               journal: cleanText(rawJournal),
               doi,
-              status: 'success'
+              status: 'success',
+              issns: item.ISSN || []
             };
           }
         }
@@ -130,6 +333,11 @@ export default function App() {
       setResults([...updatedResults]);
       setProgress({ current: i + 1, total: lines.length });
       await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    if (updatedResults.length > 0 && jcrUrl) {
+      const finalResults = await fetchJournalPercentiles(updatedResults, jcrUrl);
+      setResults(finalResults);
     }
 
     setIsProcessing(false);
@@ -146,20 +354,22 @@ export default function App() {
     setIsProcessing(true);
     setResults([]);
     setProgress({ current: 0, total: fNums.length });
-
-    let dateParam = '';
-    if (startMonth.trim() || endMonth.trim()) {
-      const sYear = startMonth ? startMonth.split('-')[0] : '1950';
-      // Use 2050 as default end year to ensure we catch all future papers and avoid negative ranges
-      const eYear = endMonth ? endMonth.split('-')[0] : '2050';
-      dateParam = `&date=${sYear}-${eYear}`;
-    }
     
     let combinedResults: (PaperInfo & { _needsAuthors?: boolean })[] = [];
 
     for (let i = 0; i < fNums.length; i++) {
       const fNum = fNums[i];
-      const query = `FUND-NO(${encodeURIComponent(fNum)})`;
+      
+      let queryStr = `FUND-NO(${fNum})`;
+      if (startMonth.trim() || endMonth.trim()) {
+        const sYear = startMonth ? startMonth.split('-')[0] : '1950';
+        // Use 2050 as default end year
+        const eYear = endMonth ? endMonth.split('-')[0] : '2050';
+        // Scopus &date=YYYY-YYYY is currently returning 500 Internal Server Errors on Elsevier's side, 
+        // so we use PUBYEAR in the query string instead as a robust workaround.
+        queryStr += ` AND PUBYEAR > ${parseInt(sYear, 10) - 1} AND PUBYEAR < ${parseInt(eYear, 10) + 1}`;
+      }
+      const query = encodeURIComponent(queryStr);
       
       try {
         let allEntries: any[] = [];
@@ -170,7 +380,7 @@ export default function App() {
         let useCompleteView = true;
 
         while (start < totalResults) {
-          let url = `https://api.elsevier.com/content/search/scopus?query=${query}${dateParam}&count=${count}&start=${start}${useCompleteView ? '&view=COMPLETE' : ''}`;
+          let url = `https://api.elsevier.com/content/search/scopus?query=${query}&count=${count}&start=${start}${useCompleteView ? '&view=COMPLETE' : ''}`;
           
           let response = await fetch(url, {
             headers: {
@@ -182,7 +392,7 @@ export default function App() {
           // If view=COMPLETE fails, fallback to standard view
           if (!response.ok && useCompleteView) {
             useCompleteView = false;
-            url = `https://api.elsevier.com/content/search/scopus?query=${query}${dateParam}&count=${count}&start=${start}`;
+            url = `https://api.elsevier.com/content/search/scopus?query=${query}&count=${count}&start=${start}`;
             response = await fetch(url, {
               headers: {
                 'X-ELS-APIKey': scopusApiKey.trim(),
@@ -269,6 +479,7 @@ export default function App() {
               journal: cleanText(entry['prism:publicationName'] || 'Unknown Journal'),
               doi: entry['prism:doi'] || '',
               status: 'success',
+              issns: [entry['prism:issn'], entry['prism:eIssn']].filter(Boolean) as string[],
               _needsAuthors: !hasFullAuthors && !!entry['prism:doi']
             };
           });
@@ -323,13 +534,19 @@ export default function App() {
       }
     }
 
+    // Phase 4: Fetch Journal Percentiles
+    if (combinedResults.length > 0 && jcrUrl) {
+      combinedResults = await fetchJournalPercentiles(combinedResults, jcrUrl);
+      setResults([...combinedResults]);
+    }
+
     setIsProcessing(false);
   };
 
   const exportCSV = useCallback(() => {
     if (results.length === 0) return;
 
-    const headers = ['Input/ID', 'Type', 'Title', 'Authors', 'Publication Date', 'Journal/Publisher', 'DOI', 'Status'];
+    const headers = ['Input/ID', 'Type', 'Title', 'Authors', 'Publication Date', 'Journal/Publisher', 'Top %', 'DOI', 'Status'];
     const csvContent = [
       headers.join(','),
       ...results.map(r => [
@@ -339,6 +556,7 @@ export default function App() {
         `"${r.authors.replace(/"/g, '""')}"`,
         `"${r.date}"`,
         `"${r.journal.replace(/"/g, '""')}"`,
+        r.topPercentile ? `"${r.topPercentile.toFixed(2)}% (${r.topSubjectArea || ''})"` : '""',
         `"${r.doi}"`,
         r.status
       ].join(','))
@@ -401,6 +619,16 @@ export default function App() {
             >
               Crossref (DOI / Title)
             </button>
+            <button
+              onClick={() => setActiveTab('settings')}
+              className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                activeTab === 'settings' 
+                  ? 'border-blue-600 text-blue-600' 
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+              }`}
+            >
+              Settings
+            </button>
           </div>
         </header>
 
@@ -410,7 +638,50 @@ export default function App() {
           <div className="lg:col-span-1 space-y-4">
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col h-[500px]">
               
-              {activeTab === 'crossref' ? (
+              {activeTab === 'settings' ? (
+                <div className="flex flex-col gap-4 h-full">
+                  <div>
+                    <label className="text-sm font-medium text-gray-700 uppercase tracking-wider mb-2 flex items-center gap-2">
+                      <Settings className="w-4 h-4" />
+                      JCR Excel URL
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        value={jcrUrl}
+                        onChange={(e) => {
+                          setJcrUrl(e.target.value);
+                          localStorage.setItem('savedJcrUrl', e.target.value);
+                          setJcrUrlStatus('idle');
+                          setJcrUrlMessage('');
+                        }}
+                        placeholder="https://.../JCR_IMPACTFACTORS.xlsx"
+                        className="w-full rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
+                      />
+                      <button
+                        onClick={testJcrUrl}
+                        disabled={jcrUrlStatus === 'checking'}
+                        className="px-4 py-2 bg-blue-50 text-blue-700 text-sm font-medium rounded-xl hover:bg-blue-100 disabled:opacity-50 transition-colors whitespace-nowrap"
+                      >
+                        {jcrUrlStatus === 'checking' ? 'Checking...' : 'Verify URL'}
+                      </button>
+                    </div>
+                    {jcrUrlMessage && (
+                      <div className={`mt-3 p-3 rounded-xl flex items-start gap-2 text-sm ${
+                        jcrUrlStatus === 'success' ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'
+                      }`}>
+                        {jcrUrlStatus === 'success' ? <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" /> : <XCircle className="w-4 h-4 mt-0.5 shrink-0" />}
+                        <span>{jcrUrlMessage}</span>
+                      </div>
+                    )}
+                    <p className="text-xs text-gray-500 mt-3">
+                      URL to an Excel file with JIF Quartiles to determine top journal percentage. 
+                      Must have 'Category', 'ISSN', and 'eISSN' columns. It also supports the new 'JIF Rank' column.
+                    </p>
+                  </div>
+                  
+                </div>
+              ) : activeTab === 'crossref' ? (
                 <>
                   <div className="flex justify-between items-center mb-3">
                     <label htmlFor="input-list" className="text-sm font-medium text-gray-700 uppercase tracking-wider">
@@ -563,30 +834,41 @@ export default function App() {
                   <h2 className="text-sm font-medium text-gray-700 uppercase tracking-wider">
                     Results
                   </h2>
-                  {isProcessing && activeTab === 'crossref' && (
-                    <div className="text-xs text-blue-600 font-medium bg-blue-50 px-3 py-1 rounded-full flex items-center gap-2">
-                      <Loader2 className="w-3 h-3 animate-spin" />
-                      {progress.current} / {progress.total}
-                    </div>
-                  )}
-                  {results.length > 0 && activeTab === 'scopus' && !isProcessing && (
-                    <div className="text-xs text-green-600 font-medium bg-green-50 px-3 py-1 rounded-full">
-                      Found {results.length} papers
-                    </div>
-                  )}
+                  {activeTab === 'scopus' || activeTab === 'crossref' ? (
+                    <>
+                      {isProcessing && activeTab === 'crossref' && (
+                        <div className="text-xs text-blue-600 font-medium bg-blue-50 px-3 py-1 rounded-full flex items-center gap-2">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          {progress.current} / {progress.total}
+                        </div>
+                      )}
+                      {results.length > 0 && activeTab === 'scopus' && !isProcessing && (
+                        <div className="text-xs text-green-600 font-medium bg-green-50 px-3 py-1 rounded-full">
+                          Found {results.length} papers
+                        </div>
+                      )}
+                    </>
+                  ) : null}
                 </div>
-                <button
-                  onClick={exportCSV}
-                  disabled={results.length === 0 || isProcessing}
-                  className="text-sm font-medium text-gray-600 hover:text-blue-600 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <Download className="w-4 h-4" />
-                  Export CSV
-                </button>
+                {activeTab === 'scopus' || activeTab === 'crossref' ? (
+                  <button
+                    onClick={exportCSV}
+                    disabled={results.length === 0 || isProcessing}
+                    className="text-sm font-medium text-gray-600 hover:text-blue-600 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Download className="w-4 h-4" />
+                    Export CSV
+                  </button>
+                ) : null}
               </div>
 
               <div className="flex-1 overflow-auto border border-gray-100 rounded-xl">
-                {results.length === 0 ? (
+                {activeTab === 'settings' ? (
+                   <div className="h-full flex flex-col items-center justify-center text-gray-400 space-y-3">
+                      <Settings className="w-12 h-12 opacity-20" />
+                      <p className="text-sm">Configure your settings in the left panel.</p>
+                   </div>
+                ) : results.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-gray-400 space-y-3">
                     <FileText className="w-12 h-12 opacity-20" />
                     <p className="text-sm">
@@ -604,6 +886,7 @@ export default function App() {
                         <th className="p-3 font-medium text-gray-500 border-b border-gray-200">Authors</th>
                         <th className="p-3 font-medium text-gray-500 border-b border-gray-200">Date</th>
                         <th className="p-3 font-medium text-gray-500 border-b border-gray-200">Journal</th>
+                        <th className="p-3 font-medium text-gray-500 border-b border-gray-200">Top %</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
@@ -627,6 +910,18 @@ export default function App() {
                           </td>
                           <td className="p-3 max-w-[150px] truncate text-gray-600" title={result.journal}>
                             {result.journal}
+                          </td>
+                          <td className="p-3 whitespace-nowrap">
+                            {result.topPercentile ? (
+                              <span 
+                                className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 cursor-help"
+                                title={result.topSubjectArea}
+                              >
+                                Top {result.topPercentile.toFixed(2)}%
+                              </span>
+                            ) : (
+                              <span className="text-gray-300">-</span>
+                            )}
                           </td>
                         </tr>
                       ))}
