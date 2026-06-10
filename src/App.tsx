@@ -212,6 +212,7 @@ export default function App() {
   // Scopus State
   const [scopusApiKey, setScopusApiKey] = useState('a3506e81fdc320fdee24ea389b06ca33');
   const [fundingNumber, setFundingNumber] = useState(() => localStorage.getItem('savedFundingNumber') || '');
+  const [authorId, setAuthorId] = useState(() => localStorage.getItem('savedAuthorId') || '');
   const [startMonth, setStartMonth] = useState('');
   const [endMonth, setEndMonth] = useState('');
 
@@ -344,23 +345,42 @@ export default function App() {
   };
 
   const searchScopus = async () => {
-    if (!scopusApiKey.trim() || !fundingNumber.trim()) return;
+    if (!scopusApiKey.trim()) return;
+    if (!fundingNumber.trim() && !authorId.trim()) return;
 
     localStorage.setItem('savedFundingNumber', fundingNumber.trim());
+    localStorage.setItem('savedAuthorId', authorId.trim());
 
-    const fNums = fundingNumber.split(/[\n,]+/).map(n => n.trim()).filter(Boolean);
-    if (fNums.length === 0) return;
+    const fNums = fundingNumber.split(/[\n,]+/).map(n => n.trim());
+    const aIds = authorId.split(/[\n,]+/).map(n => n.trim());
+    
+    // Clean up empty items at the end
+    while(fNums.length > 0 && !fNums[fNums.length - 1]) fNums.pop();
+    while(aIds.length > 0 && !aIds[aIds.length - 1]) aIds.pop();
+
+    const maxLen = Math.max(fNums.length, aIds.length);
+    if (maxLen === 0) return;
 
     setIsProcessing(true);
     setResults([]);
-    setProgress({ current: 0, total: fNums.length });
+    setProgress({ current: 0, total: maxLen });
     
     let combinedResults: (PaperInfo & { _needsAuthors?: boolean })[] = [];
 
-    for (let i = 0; i < fNums.length; i++) {
-      const fNum = fNums[i];
+    for (let i = 0; i < maxLen; i++) {
+      const fNum = fNums[i] || '';
+      const aId = aIds[i] || '';
       
-      let queryStr = `FUND-NO(${fNum})`;
+      if (!fNum && !aId) continue;
+      
+      const displayId = [fNum, aId].filter(Boolean).join(' | ');
+      
+      let queryParts = [];
+      if (fNum) queryParts.push(`FUND-NO(${fNum})`);
+      if (aId) queryParts.push(`AU-ID(${aId})`);
+      
+      let queryStr = queryParts.length > 1 ? `(${queryParts.join(' OR ')})` : queryParts[0];
+
       if (startMonth.trim() || endMonth.trim()) {
         const sYear = startMonth ? startMonth.split('-')[0] : '1950';
         // Use 2050 as default end year
@@ -446,9 +466,9 @@ export default function App() {
 
         if (filteredEntries.length === 0) {
           combinedResults.push({
-            id: fNum,
+            id: displayId,
             type: 'funding',
-            title: `No results found for funding number: ${fNum}`,
+            title: `No results found for ${displayId}`,
             authors: '',
             date: '',
             journal: '',
@@ -471,7 +491,7 @@ export default function App() {
             }
 
             return {
-              id: entry['dc:identifier'] || fNum,
+              id: entry['dc:identifier'] || displayId,
               type: 'funding',
               title: cleanText(entry['dc:title'] || 'Unknown Title'),
               authors: cleanText(rawAuthors),
@@ -488,11 +508,11 @@ export default function App() {
         }
         
         setResults([...combinedResults]);
-        setProgress({ current: i + 1, total: fNums.length });
+        setProgress({ current: i + 1, total: maxLen });
 
       } catch (error: any) {
         combinedResults.push({
-          id: fNum,
+          id: displayId,
           type: 'funding',
           title: `Search failed`,
           authors: '',
@@ -503,7 +523,7 @@ export default function App() {
           errorMsg: error.message
         });
         setResults([...combinedResults]);
-        setProgress({ current: i + 1, total: fNums.length });
+        setProgress({ current: i + 1, total: maxLen });
       }
     }
 
@@ -577,6 +597,7 @@ export default function App() {
   const clearAll = () => {
     setInputText('');
     setFundingNumber('');
+    setAuthorId('');
     setStartMonth('');
     setEndMonth('');
     setResults([]);
@@ -594,7 +615,7 @@ export default function App() {
             Paper Metadata Extractor
           </h1>
           <p className="text-gray-500 text-sm md:text-base max-w-2xl">
-            Extract publication dates, authors, journals, and DOIs using Crossref (by DOI/Title) or Scopus (by Funding Number).
+            Extract publication dates, authors, journals, and DOIs using Crossref (by DOI/Title) or Scopus (by Funding Number / Author ID).
           </p>
           
           {/* Tabs */}
@@ -607,7 +628,7 @@ export default function App() {
                   : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
               }`}
             >
-              Scopus (Funding Number)
+              Scopus (Funding / Author)
             </button>
             <button
               onClick={() => setActiveTab('crossref')}
@@ -636,7 +657,7 @@ export default function App() {
           
           {/* Input Section */}
           <div className="lg:col-span-1 space-y-4">
-            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col h-[500px]">
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col min-h-[600px]">
               
               {activeTab === 'settings' ? (
                 <div className="flex flex-col gap-4 h-full">
@@ -760,8 +781,26 @@ export default function App() {
                       <textarea
                         value={fundingNumber}
                         onChange={(e) => setFundingNumber(e.target.value)}
-                        placeholder="e.g., NRF-2021R1A2C1000000&#10;2020R1A5A8018822"
-                        className="w-full resize-none h-[120px] rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
+                        placeholder="e.g., NRF-2021R1A2C1000000"
+                        className="w-full resize-none h-[80px] rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
+                        disabled={isProcessing}
+                      />
+                    </div>
+
+                    <div className="flex-1">
+                      <div className="flex justify-between items-center mb-2">
+                        <label className="text-sm font-medium text-gray-700 uppercase tracking-wider block">
+                          Author ID(s)
+                        </label>
+                        <span className="text-xs text-gray-400 bg-gray-100 px-2 py-1 rounded-full">
+                          {authorId.split(/[\n,]+/).filter(l => l.trim()).length} items
+                        </span>
+                      </div>
+                      <textarea
+                        value={authorId}
+                        onChange={(e) => setAuthorId(e.target.value)}
+                        placeholder="e.g., 57209617104"
+                        className="w-full resize-none h-[80px] rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
                         disabled={isProcessing}
                       />
                     </div>
@@ -796,7 +835,7 @@ export default function App() {
                     <div className="mt-auto flex gap-3">
                       <button
                         onClick={searchScopus}
-                        disabled={isProcessing || !scopusApiKey.trim() || !fundingNumber.trim()}
+                        disabled={isProcessing || !scopusApiKey.trim() || (!fundingNumber.trim() && !authorId.trim())}
                         className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-4 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                       >
                         {isProcessing ? (
@@ -813,7 +852,7 @@ export default function App() {
                       </button>
                       <button
                         onClick={clearAll}
-                        disabled={isProcessing || (!fundingNumber && results.length === 0)}
+                        disabled={isProcessing || (!fundingNumber && !authorId && results.length === 0)}
                         className="bg-gray-100 hover:bg-gray-200 text-gray-700 p-2.5 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         title="Clear All"
                       >
@@ -874,7 +913,7 @@ export default function App() {
                     <p className="text-sm">
                       {activeTab === 'crossref' 
                         ? 'Enter DOIs or titles and click Extract to see results.'
-                        : 'Enter an API Key and Funding Number to search Scopus.'}
+                        : 'Enter an API Key and Funding Number or Author ID to search Scopus.'}
                     </p>
                   </div>
                 ) : (
