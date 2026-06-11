@@ -35,11 +35,43 @@ let jcrCache: { url: string; data: Record<string, { percentile: number; category
 const loadJCRData = async (url: string) => {
   if (jcrCache && jcrCache.url === url) return jcrCache.data;
   
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to load JCR data (${res.status}): ${res.statusText}`);
+  let buffer: ArrayBuffer;
+  try {
+    // 1st attempt: Try to use our local Express API proxy
+    const proxyRes = await fetch("/api/proxy-jcr", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    if (proxyRes.ok) {
+      buffer = await proxyRes.arrayBuffer();
+    } else {
+      throw new Error(`Proxy status ${proxyRes.status}`);
+    }
+  } catch (proxyError) {
+    console.log("Local API proxy is unavailable or failed, attempting direct fetch...", proxyError);
+    try {
+      // 2nd attempt: Direct client-side fetch
+      const directRes = await fetch(url);
+      if (!directRes.ok) {
+        throw new Error(`Direct fetch failed: ${directRes.status}`);
+      }
+      buffer = await directRes.arrayBuffer();
+    } catch (directError) {
+      console.log("Direct fetch failed (likely CORS), attempting public CORS bypass proxy...", directError);
+      try {
+        // 3rd attempt: Using a public CORS-bypassing proxy (allorigins)
+        const corsProxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+        const proxyRes = await fetch(corsProxyUrl);
+        if (!proxyRes.ok) {
+          throw new Error(`CORS proxy returned status ${proxyRes.status}`);
+        }
+        buffer = await proxyRes.arrayBuffer();
+      } catch (corsError: any) {
+        throw new Error(`Failed to load JCR data across all endpoints: ${corsError.message || corsError}`);
+      }
+    }
   }
-  const buffer = await res.arrayBuffer();
   const workbook = xlsx.read(buffer, { type: 'buffer' });
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
