@@ -35,11 +35,7 @@ let jcrCache: { url: string; data: Record<string, { percentile: number; category
 const loadJCRData = async (url: string) => {
   if (jcrCache && jcrCache.url === url) return jcrCache.data;
   
-  const res = await fetch("/api/proxy-jcr", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url })
-  });
+  const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`Failed to load JCR data (${res.status}): ${res.statusText}`);
   }
