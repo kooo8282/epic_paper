@@ -109,21 +109,24 @@ async function runWithConcurrency<T>(
   return results;
 }
 
+// Session-level tracking of COMPLETE view support for Scopus API key
+let globalCompleteViewSupported: boolean | null = null;
+
 // Fetch single Scopus page through /api/scopus with rate limit handling, backoff, and caching
 async function fetchScopusPage(
   query: string,
   start: number,
   count = 25,
-  useCompleteView = true,
+  useCompleteView = globalCompleteViewSupported !== false,
   maxRetries = 3
 ): Promise<{ data: any; usedCompleteView: boolean }> {
-  const cacheKey = `${query}|${start}|${count}|${useCompleteView ? 'C' : 'S'}`;
-  if (apiResponseCache.has(cacheKey)) {
-    return { data: apiResponseCache.get(cacheKey), usedCompleteView: useCompleteView };
-  }
-
   let attempt = 0;
-  let currentUseComplete = useCompleteView;
+  let currentUseComplete = globalCompleteViewSupported === false ? false : useCompleteView;
+
+  const cacheKey = `${query}|${start}|${count}|${currentUseComplete ? 'C' : 'S'}`;
+  if (apiResponseCache.has(cacheKey)) {
+    return { data: apiResponseCache.get(cacheKey), usedCompleteView: currentUseComplete };
+  }
 
   while (attempt <= maxRetries) {
     const params = new URLSearchParams({
@@ -144,9 +147,10 @@ async function fetchScopusPage(
       });
       clearTimeout(timeoutId);
 
-      // Handle view=COMPLETE fallback on 400/403/500 if complete view is rejected
-      if (!response.ok && currentUseComplete && (response.status === 400 || response.status === 403 || response.status === 500)) {
+      // Handle view=COMPLETE fallback on 401/400/403/500 if complete view is rejected or unauthorized
+      if (!response.ok && currentUseComplete && (response.status === 401 || response.status === 400 || response.status === 403 || response.status === 500)) {
         currentUseComplete = false;
+        globalCompleteViewSupported = false;
         continue;
       }
 
@@ -217,7 +221,7 @@ async function fetchAllResultsForQuery(
   let start = 0;
   const count = 25;
   let totalResults = 0;
-  let useCompleteView = true;
+  let useCompleteView = globalCompleteViewSupported !== false;
   let isFirst = true;
   let incomplete = false;
 
