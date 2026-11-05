@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { Search, Download, Trash2, FileText, CheckCircle2, XCircle, Loader2, AlertCircle, Key, Settings, Upload, Link } from 'lucide-react';
+import { Search, Download, Trash2, FileText, CheckCircle2, XCircle, Loader2, AlertCircle, Settings, Upload, Link } from 'lucide-react';
 import * as xlsx from 'xlsx';
 
 interface PaperInfo {
@@ -187,8 +187,8 @@ const loadJCRData = async (inputUrl: string) => {
     } else {
       let errText = '';
       try {
-        const errJson = await proxyRes.json();
-        errText = errJson.error;
+        const errJson: any = await proxyRes.json();
+        errText = errJson?.error || '';
       } catch {
         errText = `HTTP ${proxyRes.status} ${proxyRes.statusText}`;
       }
@@ -235,7 +235,15 @@ const loadJCRData = async (inputUrl: string) => {
 
 const fetchJournalPercentiles = async (papers: PaperInfo[], jcrUrl: string): Promise<PaperInfo[]> => {
   try {
-    const map = jcrCache?.data || (jcrUrl ? await loadJCRData(jcrUrl) : null);
+    let map = jcrCache?.data || null;
+    if (!map && jcrUrl && jcrUrl.trim()) {
+      try {
+        map = await loadJCRData(jcrUrl);
+      } catch (loadErr: any) {
+        console.warn("JCR data could not be loaded from URL, skipping percentile matching:", loadErr?.message || loadErr);
+        return papers;
+      }
+    }
     if (!map) return papers;
     return papers.map(p => {
       let bestPercentile = 100;
@@ -263,7 +271,7 @@ const fetchJournalPercentiles = async (papers: PaperInfo[], jcrUrl: string): Pro
       return p;
     });
   } catch (err) {
-    console.error("Failed to load JCR data:", err);
+    console.warn("Failed to load JCR data:", err);
     return papers;
   }
 };
@@ -275,14 +283,13 @@ export default function App() {
   const [inputText, setInputText] = useState('');
   
   // Scopus State
-  const [scopusApiKey, setScopusApiKey] = useState('a3506e81fdc320fdee24ea389b06ca33');
   const [fundingNumber, setFundingNumber] = useState(() => localStorage.getItem('savedFundingNumber') || '');
   const [authorId, setAuthorId] = useState(() => localStorage.getItem('savedAuthorId') || '');
   const [startMonth, setStartMonth] = useState('');
   const [endMonth, setEndMonth] = useState('');
 
   // Settings State
-  const [jcrUrl, setJcrUrl] = useState(() => localStorage.getItem('savedJcrUrl') || 'https://pub-204bf897281b4764977b8ab503859be6.r2.dev/2025%20JCR%20IMPACTFACTORS%20with%20JIF%20Quartiles.xlsx');
+  const [jcrUrl, setJcrUrl] = useState(() => localStorage.getItem('savedJcrUrl') || '');
   const [jcrUrlStatus, setJcrUrlStatus] = useState<'idle' | 'checking' | 'success' | 'error'>('idle');
   const [jcrUrlMessage, setJcrUrlMessage] = useState('');
   const [loadedJournalCount, setLoadedJournalCount] = useState<number>(() => {
@@ -386,13 +393,13 @@ export default function App() {
              updatedResults[i] = { ...updatedResults[i], status: 'error', errorMsg: `HTTP ${response.status}` };
           }
         } else {
-          const data = await response.json();
+          const data: any = await response.json();
           let item;
           
           if (type === 'doi') {
-            item = data.message;
+            item = data?.message;
           } else {
-            if (data.message.items.length === 0) {
+            if (!data?.message?.items || data.message.items.length === 0) {
               updatedResults[i] = { ...updatedResults[i], status: 'not_found' };
               item = null;
             } else {
@@ -509,7 +516,6 @@ export default function App() {
   };
 
   const searchScopus = async () => {
-    if (!scopusApiKey.trim()) return;
     if (!fundingNumber.trim() && !authorId.trim()) return;
 
     localStorage.setItem('savedFundingNumber', fundingNumber.trim());
@@ -564,11 +570,10 @@ export default function App() {
         let useCompleteView = true;
 
         while (start < totalResults) {
-          let url = `https://api.elsevier.com/content/search/scopus?query=${query}&count=${count}&start=${start}${useCompleteView ? '&view=COMPLETE' : ''}`;
+          let url = `/api/scopus?query=${query}&count=${count}&start=${start}${useCompleteView ? '&view=COMPLETE' : ''}`;
           
           let response = await fetch(url, {
             headers: {
-              'X-ELS-APIKey': scopusApiKey.trim(),
               'Accept': 'application/json'
             }
           });
@@ -576,10 +581,9 @@ export default function App() {
           // If view=COMPLETE fails, fallback to standard view
           if (!response.ok && useCompleteView) {
             useCompleteView = false;
-            url = `https://api.elsevier.com/content/search/scopus?query=${query}&count=${count}&start=${start}`;
+            url = `/api/scopus?query=${query}&count=${count}&start=${start}`;
             response = await fetch(url, {
               headers: {
-                'X-ELS-APIKey': scopusApiKey.trim(),
                 'Accept': 'application/json'
               }
             });
@@ -588,15 +592,15 @@ export default function App() {
           if (!response.ok) {
             let errorDetail = response.statusText;
             try {
-              const errJson = await response.json();
-              errorDetail = errJson['service-error']?.status?.statusText || JSON.stringify(errJson);
+              const errJson: any = await response.json();
+              errorDetail = errJson?.error || errJson?.['service-error']?.status?.statusText || JSON.stringify(errJson);
             } catch (e) {
               // Ignore JSON parse error
             }
             throw new Error(`HTTP ${response.status}: ${errorDetail}`);
           }
 
-          const data = await response.json();
+          const data: any = await response.json();
           
           if (isFirst) {
             totalResults = parseInt(data['search-results']?.['opensearch:totalResults'] || '0', 10);
@@ -702,8 +706,8 @@ export default function App() {
           try {
             const crRes = await fetch(`https://api.crossref.org/works/${encodeURIComponent(combinedResults[i].doi)}`);
             if (crRes.ok) {
-              const crData = await crRes.json();
-              if (crData.message && crData.message.author) {
+              const crData: any = await crRes.json();
+              if (crData?.message?.author) {
                 const fullAuthors = crData.message.author.map((a: any) => `${a.given || ''} ${a.family || ''}`.trim()).join(', ');
                 if (fullAuthors) {
                   combinedResults[i].authors = cleanText(fullAuthors);
@@ -965,24 +969,6 @@ export default function App() {
               ) : (
                 <>
                   <div className="flex flex-col gap-4 h-full">
-                    <div>
-                      <label className="text-sm font-medium text-gray-700 uppercase tracking-wider mb-2 block flex items-center gap-2">
-                        <Key className="w-4 h-4" />
-                        Scopus API Key
-                      </label>
-                      <input
-                        type="password"
-                        value={scopusApiKey}
-                        onChange={(e) => setScopusApiKey(e.target.value)}
-                        placeholder="Enter your Elsevier API Key"
-                        className="w-full rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
-                        disabled={isProcessing}
-                      />
-                      <p className="text-xs text-gray-500 mt-2">
-                        Required to use Scopus API. Get one from the <a href="https://dev.elsevier.com/" target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">Elsevier Developer Portal</a>.
-                      </p>
-                    </div>
-
                     <div className="flex-1">
                       <div className="flex justify-between items-center mb-2">
                         <label className="text-sm font-medium text-gray-700 uppercase tracking-wider block">
@@ -996,7 +982,7 @@ export default function App() {
                         value={fundingNumber}
                         onChange={(e) => setFundingNumber(e.target.value)}
                         placeholder="e.g., NRF-2021R1A2C1000000"
-                        className="w-full resize-none h-[80px] rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
+                        className="w-full resize-none h-[110px] rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
                         disabled={isProcessing}
                       />
                     </div>
@@ -1014,7 +1000,7 @@ export default function App() {
                         value={authorId}
                         onChange={(e) => setAuthorId(e.target.value)}
                         placeholder="e.g., 57209617104"
-                        className="w-full resize-none h-[80px] rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
+                        className="w-full resize-none h-[110px] rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
                         disabled={isProcessing}
                       />
                     </div>
@@ -1049,7 +1035,7 @@ export default function App() {
                     <div className="mt-auto flex gap-3">
                       <button
                         onClick={searchScopus}
-                        disabled={isProcessing || !scopusApiKey.trim() || (!fundingNumber.trim() && !authorId.trim())}
+                        disabled={isProcessing || (!fundingNumber.trim() && !authorId.trim())}
                         className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-4 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                       >
                         {isProcessing ? (
@@ -1127,7 +1113,7 @@ export default function App() {
                     <p className="text-sm">
                       {activeTab === 'crossref' 
                         ? 'Enter DOIs or titles and click Extract to see results.'
-                        : 'Enter an API Key and Funding Number or Author ID to search Scopus.'}
+                        : 'Enter Funding Number or Author ID to search Scopus.'}
                     </p>
                   </div>
                 ) : (
