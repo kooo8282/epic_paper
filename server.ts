@@ -11,7 +11,8 @@ app.use(express.json());
 
 // Local dev proxy for /api/scopus (mirrors Cloudflare Pages function at functions/api/scopus.ts)
 app.get("/api/scopus", async (req, res) => {
-  const apiKey = process.env.SCOPUS_API_KEY?.trim();
+  const rawKey = process.env.SCOPUS_API_KEY?.trim() || '';
+  const apiKey = rawKey.replace(/^["']|["']$/g, '').trim();
   if (!apiKey) {
     return res.status(500).json({
       error: "SCOPUS_API_KEY secret is not configured. On Cloudflare Pages, set the SCOPUS_API_KEY environment secret.",
@@ -36,20 +37,34 @@ app.get("/api/scopus", async (req, res) => {
   const start = parseInt((req.query.start as string) || "0", 10);
   upstreamUrl.searchParams.set("start", String(isNaN(start) || start < 0 || start > 5000 ? 0 : start));
 
-  if (req.query.view === "COMPLETE") {
-    upstreamUrl.searchParams.set("view", "COMPLETE");
-  } else if (req.query.view === "STANDARD") {
-    upstreamUrl.searchParams.set("view", "STANDARD");
+  let requestedView = (req.query.view as string)?.toUpperCase();
+  if (requestedView !== "COMPLETE" && requestedView !== "STANDARD") {
+    requestedView = "STANDARD";
   }
+  upstreamUrl.searchParams.set("view", requestedView);
 
   try {
-    const upstreamRes = await fetch(upstreamUrl.toString(), {
-      headers: {
-        "X-ELS-APIKey": apiKey,
-        "Accept": "application/json",
-        "User-Agent": "EPIC-Paper-Local-Dev/1.0",
-      },
-    });
+    async function executeFetch(targetUrl: string) {
+      return await fetch(targetUrl, {
+        headers: {
+          "X-ELS-APIKey": apiKey,
+          "Accept": "application/json",
+          "User-Agent": "EPIC-Paper/1.0",
+        },
+      });
+    }
+
+    let upstreamRes = await executeFetch(upstreamUrl.toString());
+
+    if (!upstreamRes.ok && requestedView === "COMPLETE" && (upstreamRes.status === 401 || upstreamRes.status === 403 || upstreamRes.status === 500)) {
+      upstreamUrl.searchParams.set("view", "STANDARD");
+      upstreamRes = await executeFetch(upstreamUrl.toString());
+    }
+
+    if (!upstreamRes.ok && upstreamRes.status >= 500 && upstreamRes.status <= 504) {
+      await new Promise((r) => setTimeout(r, 600));
+      upstreamRes = await executeFetch(upstreamUrl.toString());
+    }
 
     if (!upstreamRes.ok) {
       let safeErrorDetail = `Upstream Scopus API error (${upstreamRes.status})`;

@@ -30,7 +30,8 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   }
 
   // 1. Verify Cloudflare Secret configuration
-  const apiKey = env.SCOPUS_API_KEY?.trim();
+  const rawKey = env.SCOPUS_API_KEY?.trim() || '';
+  const apiKey = rawKey.replace(/^["']|["']$/g, '').trim();
   if (!apiKey) {
     return new Response(
       JSON.stringify({
@@ -94,31 +95,45 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       upstreamUrl.searchParams.set('start', '0');
     }
 
-    // view (support COMPLETE or STANDARD)
-    const viewParam = searchParams.get('view');
-    if (viewParam === 'COMPLETE') {
-      upstreamUrl.searchParams.set('view', 'COMPLETE');
-    } else if (viewParam === 'STANDARD') {
-      upstreamUrl.searchParams.set('view', 'STANDARD');
+    // view (support COMPLETE or STANDARD, default to STANDARD)
+    let requestedView = searchParams.get('view')?.toUpperCase();
+    if (requestedView !== 'COMPLETE' && requestedView !== 'STANDARD') {
+      requestedView = 'STANDARD';
+    }
+    upstreamUrl.searchParams.set('view', requestedView);
+
+    // 3. Forward request to Elsevier Scopus API with timeout and resilient retry
+    async function executeUpstreamFetch(targetUrl: string) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      try {
+        return await fetch(targetUrl, {
+          method: 'GET',
+          headers: {
+            'X-ELS-APIKey': apiKey,
+            'Accept': 'application/json',
+            'User-Agent': 'EPIC-Paper/1.0',
+          },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
     }
 
-    // 3. Forward request to Elsevier Scopus API with timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+    let upstreamResponse = await executeUpstreamFetch(upstreamUrl.toString());
 
-    let upstreamResponse: Response;
-    try {
-      upstreamResponse = await fetch(upstreamUrl.toString(), {
-        method: 'GET',
-        headers: {
-          'X-ELS-APIKey': apiKey,
-          'Accept': 'application/json',
-          'User-Agent': 'EPIC-Paper-Cloudflare-Function/1.0',
-        },
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeoutId);
+    // Fallback: If COMPLETE view is denied (401, 403) or causes Elsevier 500 System Error,
+    // automatically fallback to STANDARD view
+    if (!upstreamResponse.ok && requestedView === 'COMPLETE' && (upstreamResponse.status === 401 || upstreamResponse.status === 403 || upstreamResponse.status === 500)) {
+      upstreamUrl.searchParams.set('view', 'STANDARD');
+      upstreamResponse = await executeUpstreamFetch(upstreamUrl.toString());
+    }
+
+    // Resilience: If Elsevier has a transient 5xx glitch, retry once after a short 600ms backoff
+    if (!upstreamResponse.ok && upstreamResponse.status >= 500 && upstreamResponse.status <= 504) {
+      await new Promise((r) => setTimeout(r, 600));
+      upstreamResponse = await executeUpstreamFetch(upstreamUrl.toString());
     }
 
     // 4. Handle upstream error responses cleanly without exposing sensitive headers or credentials

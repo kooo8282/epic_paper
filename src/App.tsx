@@ -109,19 +109,19 @@ async function runWithConcurrency<T>(
   return results;
 }
 
-// Session-level tracking of COMPLETE view support for Scopus API key
-let globalCompleteViewSupported: boolean | null = null;
+// Session-level tracking of COMPLETE view support for Scopus API key (default false for developer keys)
+let globalCompleteViewSupported = false;
 
 // Fetch single Scopus page through /api/scopus with rate limit handling, backoff, and caching
 async function fetchScopusPage(
   query: string,
   start: number,
   count = 25,
-  useCompleteView = globalCompleteViewSupported !== false,
+  useCompleteView = false,
   maxRetries = 3
 ): Promise<{ data: any; usedCompleteView: boolean }> {
   let attempt = 0;
-  let currentUseComplete = globalCompleteViewSupported === false ? false : useCompleteView;
+  let currentUseComplete = useCompleteView && globalCompleteViewSupported;
 
   const cacheKey = `${query}|${start}|${count}|${currentUseComplete ? 'C' : 'S'}`;
   if (apiResponseCache.has(cacheKey)) {
@@ -133,7 +133,7 @@ async function fetchScopusPage(
       query,
       count: String(count),
       start: String(start),
-      ...(currentUseComplete ? { view: 'COMPLETE' } : { view: 'STANDARD' }),
+      view: currentUseComplete ? 'COMPLETE' : 'STANDARD',
     });
 
     try {
@@ -157,13 +157,24 @@ async function fetchScopusPage(
       // Handle Rate Limiting (429) & Transient 5xx
       if (response.status === 429 || (response.status >= 500 && response.status <= 504)) {
         if (attempt >= maxRetries) {
-          const errBody = await response.text().catch(() => '');
-          throw new Error(`Scopus API error (${response.status}): ${errBody || response.statusText}`);
+          const rawErr = await response.text().catch(() => '');
+          let detail = rawErr;
+          try {
+            const parsed = JSON.parse(rawErr);
+            if (parsed.error === 'System Error Occurred' || parsed.error?.includes('System Error')) {
+              detail = 'Elsevier Scopus 서버 일시적 장애 (System Error Occurred) - 잠시 후 다시 시도해 주세요.';
+            } else if (parsed.error) {
+              detail = parsed.error;
+            }
+          } catch {
+            // rawErr
+          }
+          throw new Error(`Scopus API 오류 (${response.status}): ${detail}`);
         }
 
         // Check Retry-After header
         const retryAfterHeader = response.headers.get('Retry-After');
-        let delayMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+        let delayMs = 1200 * Math.pow(2, attempt); // 1.2s, 2.4s, 4.8s
         if (retryAfterHeader) {
           const parsedSeconds = parseInt(retryAfterHeader, 10);
           if (!isNaN(parsedSeconds) && parsedSeconds > 0 && parsedSeconds <= 15) {
@@ -181,10 +192,13 @@ async function fetchScopusPage(
         try {
           const errJson: any = await response.json();
           errorDetail = errJson?.error || errJson?.['service-error']?.status?.statusText || JSON.stringify(errJson);
+          if (errorDetail === 'System Error Occurred') {
+            errorDetail = 'Elsevier Scopus 서버 일시적 장애 (System Error Occurred) - 잠시 후 다시 시도해 주세요.';
+          }
         } catch {
           // ignore json parse error
         }
-        throw new Error(`Scopus API error (${response.status}): ${errorDetail}`);
+        throw new Error(`Scopus API 오류 (${response.status}): ${errorDetail}`);
       }
 
       const data = await response.json();
@@ -221,7 +235,7 @@ async function fetchAllResultsForQuery(
   let start = 0;
   const count = 25;
   let totalResults = 0;
-  let useCompleteView = globalCompleteViewSupported !== false;
+  let useCompleteView = false;
   let isFirst = true;
   let incomplete = false;
 
