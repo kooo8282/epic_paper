@@ -9,22 +9,40 @@ app.use(express.json());
 
 app.post("/api/proxy-jcr", async (req, res) => {
   try {
-    const { url } = req.body;
-    if (!url) {
-      return res.status(400).json({ error: "Missing url" });
+    let { url } = req.body;
+    if (!url || typeof url !== "string") {
+      return res.status(400).json({ error: "Missing or invalid URL" });
     }
-    const response = await fetch(url);
+
+    url = url.trim();
+
+    // Auto-convert Google Drive sharing links to direct download links
+    const gDriveMatch = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) || url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    if (gDriveMatch && (url.includes('drive.google.com') || url.includes('docs.google.com'))) {
+      const fileId = gDriveMatch[1];
+      url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+    }
+
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+
     if (!response.ok) {
-      throw new Error(`Failed to fetch: ${response.statusText}`);
+      return res.status(response.status).json({
+        error: `Remote server returned ${response.status} ${response.statusText || 'Not Found'}`
+      });
     }
+
     const arrayBuffer = await response.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.send(buffer);
-  } catch (error) {
+  } catch (error: any) {
     console.error("Proxy error:", error);
-    res.status(500).json({ error: String(error) });
+    res.status(502).json({ error: error?.message || "Failed to fetch remote URL" });
   }
 });
 

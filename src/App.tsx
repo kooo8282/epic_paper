@@ -1,5 +1,5 @@
-import React, { useState, useCallback } from 'react';
-import { Search, Download, Trash2, FileText, CheckCircle2, XCircle, Loader2, AlertCircle, Key, Settings } from 'lucide-react';
+import React, { useState, useCallback, useRef } from 'react';
+import { Search, Download, Trash2, FileText, CheckCircle2, XCircle, Loader2, AlertCircle, Key, Settings, Upload, Link } from 'lucide-react';
 import * as xlsx from 'xlsx';
 
 interface PaperInfo {
@@ -32,46 +32,22 @@ const cleanText = (str: string) => {
 
 let jcrCache: { url: string; data: Record<string, { percentile: number; category: string }> } | null = null;
 
-const loadJCRData = async (url: string) => {
-  if (jcrCache && jcrCache.url === url) return jcrCache.data;
-  
-  let buffer: ArrayBuffer;
-  try {
-    // 1st attempt: Try to use our local Express API proxy
-    const proxyRes = await fetch("/api/proxy-jcr", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url })
-    });
-    if (proxyRes.ok) {
-      buffer = await proxyRes.arrayBuffer();
-    } else {
-      throw new Error(`Proxy status ${proxyRes.status}`);
-    }
-  } catch (proxyError) {
-    console.log("Local API proxy is unavailable or failed, attempting direct fetch...", proxyError);
-    try {
-      // 2nd attempt: Direct client-side fetch
-      const directRes = await fetch(url);
-      if (!directRes.ok) {
-        throw new Error(`Direct fetch failed: ${directRes.status}`);
-      }
-      buffer = await directRes.arrayBuffer();
-    } catch (directError) {
-      console.log("Direct fetch failed (likely CORS), attempting public CORS bypass proxy...", directError);
-      try {
-        // 3rd attempt: Using a public CORS-bypassing proxy (allorigins)
-        const corsProxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-        const proxyRes = await fetch(corsProxyUrl);
-        if (!proxyRes.ok) {
-          throw new Error(`CORS proxy returned status ${proxyRes.status}`);
-        }
-        buffer = await proxyRes.arrayBuffer();
-      } catch (corsError: any) {
-        throw new Error(`Failed to load JCR data across all endpoints: ${corsError.message || corsError}`);
-      }
-    }
+const formatUrlForDownload = (inputUrl: string): string => {
+  let url = inputUrl.trim();
+  // Support Google Drive links: convert sharing URL to direct download URL
+  const gDriveMatch = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) || url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  if (gDriveMatch && (url.includes('drive.google.com') || url.includes('docs.google.com'))) {
+    const fileId = gDriveMatch[1];
+    return `https://drive.google.com/uc?export=download&id=${fileId}`;
   }
+  // Support Dropbox links: change dl=0 to dl=1
+  if (url.includes('dropbox.com') && url.includes('dl=0')) {
+    return url.replace('dl=0', 'dl=1');
+  }
+  return url;
+};
+
+const parseJCRWorkbook = (buffer: ArrayBuffer | Uint8Array) => {
   const workbook = xlsx.read(buffer, { type: 'buffer' });
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
@@ -87,13 +63,13 @@ const loadJCRData = async (url: string) => {
   
   const headRow = data[0];
   if (Array.isArray(headRow)) {
-    const cIdx = headRow.findIndex(h => h === 'Category');
+    const cIdx = headRow.findIndex(h => typeof h === 'string' && h.trim().toLowerCase() === 'category');
     if (cIdx >= 0) catIdx = cIdx;
-    const iIdx = headRow.findIndex(h => h === 'ISSN');
+    const iIdx = headRow.findIndex(h => typeof h === 'string' && h.trim().toLowerCase() === 'issn');
     if (iIdx >= 0) issnIdx = iIdx;
-    const eiIdx = headRow.findIndex(h => h === 'eISSN');
+    const eiIdx = headRow.findIndex(h => typeof h === 'string' && h.trim().toLowerCase() === 'eissn');
     if (eiIdx >= 0) eissnIdx = eiIdx;
-    const jIdx = headRow.findIndex(h => h === 'JIF Rank');
+    const jIdx = headRow.findIndex(h => typeof h === 'string' && h.trim().toLowerCase().includes('rank'));
     if (jIdx >= 0) jifRankIdx = jIdx;
   }
   
@@ -115,8 +91,6 @@ const loadJCRData = async (url: string) => {
     const catGroups = catStr && typeof catStr === 'string' ? catStr.split(';') : [];
     const rankGroups = jifRankStr && typeof jifRankStr === 'string' ? jifRankStr.split(';') : [];
     
-    // We expect catGroups and rankGroups to be parallel, but we can also just compute all percentiles
-    // and take the best.
     for (let cIdx = 0; cIdx < catGroups.length; cIdx++) {
       const gStr = catGroups[cIdx].trim();
       if (!gStr) continue;
@@ -158,7 +132,6 @@ const loadJCRData = async (url: string) => {
       }
     }
     
-    // Fallback if formatting was strange but there's a jifRankStr that doesn't align with categories
     if (bestPercentile === 100 && jifRankStr && typeof jifRankStr === 'string') {
         const rankSplits = jifRankStr.split(';');
         for (const rg of rankSplits) {
@@ -177,7 +150,6 @@ const loadJCRData = async (url: string) => {
         }
     }
     
-    // If we only have categoryTitle but couldn't parse percentile
     if (!bestCategoryTitle && catGroups.length > 0) {
        bestCategoryTitle = catGroups[0].split('|')[0].trim();
     }
@@ -192,14 +164,79 @@ const loadJCRData = async (url: string) => {
     tryBind(issn);
     tryBind(eissn);
   }
+
+  return map;
+};
+
+const loadJCRData = async (inputUrl: string) => {
+  const url = formatUrlForDownload(inputUrl);
+  if (jcrCache && jcrCache.url === url) return jcrCache.data;
   
+  let buffer: ArrayBuffer | null = null;
+  let lastErrorMessage = '';
+
+  // 1st attempt: Local Express API proxy (avoids CORS)
+  try {
+    const proxyRes = await fetch("/api/proxy-jcr", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    if (proxyRes.ok) {
+      buffer = await proxyRes.arrayBuffer();
+    } else {
+      let errText = '';
+      try {
+        const errJson = await proxyRes.json();
+        errText = errJson.error;
+      } catch {
+        errText = `HTTP ${proxyRes.status} ${proxyRes.statusText}`;
+      }
+      lastErrorMessage = errText || `Proxy error: HTTP ${proxyRes.status}`;
+    }
+  } catch (proxyError: any) {
+    lastErrorMessage = proxyError?.message || 'Proxy server unavailable';
+  }
+
+  // 2nd attempt: Direct client-side fetch if proxy failed
+  if (!buffer) {
+    try {
+      const directRes = await fetch(url);
+      if (directRes.ok) {
+        buffer = await directRes.arrayBuffer();
+      } else {
+        lastErrorMessage = `URL returned HTTP ${directRes.status} (${directRes.statusText || 'Not Found'})`;
+      }
+    } catch (directError: any) {
+      // 3rd attempt: CORS proxy fallback
+      try {
+        const corsProxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+        const corsRes = await fetch(corsProxyUrl, { signal: AbortSignal.timeout(8000) });
+        if (corsRes.ok) {
+          buffer = await corsRes.arrayBuffer();
+        } else {
+          lastErrorMessage = `Remote URL not found or inaccessible (HTTP ${corsRes.status})`;
+        }
+      } catch {
+        lastErrorMessage = lastErrorMessage || 'Unable to connect to the provided URL (CORS or network error).';
+      }
+    }
+  }
+
+  if (!buffer) {
+    throw new Error(lastErrorMessage || 'Failed to download the JCR Excel file. Please verify the URL or upload the file directly.');
+  }
+
+  const map = parseJCRWorkbook(buffer);
   jcrCache = { url, data: map };
   return map;
 };
 
+
 const fetchJournalPercentiles = async (papers: PaperInfo[], jcrUrl: string): Promise<PaperInfo[]> => {
   try {
-    const map = await loadJCRData(jcrUrl);
+    const map = jcrCache?.data || (jcrUrl ? await loadJCRData(jcrUrl) : null);
+    if (!map) return papers;
     return papers.map(p => {
       let bestPercentile = 100;
       let bestCategory = '';
@@ -248,6 +285,10 @@ export default function App() {
   const [jcrUrl, setJcrUrl] = useState(() => localStorage.getItem('savedJcrUrl') || 'https://pub-204bf897281b4764977b8ab503859be6.r2.dev/2025%20JCR%20IMPACTFACTORS%20with%20JIF%20Quartiles.xlsx');
   const [jcrUrlStatus, setJcrUrlStatus] = useState<'idle' | 'checking' | 'success' | 'error'>('idle');
   const [jcrUrlMessage, setJcrUrlMessage] = useState('');
+  const [loadedJournalCount, setLoadedJournalCount] = useState<number>(() => {
+    return jcrCache ? Object.keys(jcrCache.data).length : 0;
+  });
+  const fileInputRef = useRef<HTMLInputElement>(null);
   
   const testJcrUrl = async () => {
     if (!jcrUrl) return;
@@ -257,15 +298,44 @@ export default function App() {
       const map = await loadJCRData(jcrUrl);
       const count = Object.keys(map).length;
       if (count > 0) {
+        setLoadedJournalCount(count);
         setJcrUrlStatus('success');
-        setJcrUrlMessage(`Successfully loaded ${count.toLocaleString()} journals.`);
+        setJcrUrlMessage(`성공적으로 ${count.toLocaleString()}개 저널 정보를 로드했습니다.`);
       } else {
         setJcrUrlStatus('error');
-        setJcrUrlMessage('Loaded file, but found no valid journal entries.');
+        setJcrUrlMessage('파일은 읽었으나 유효한 저널(ISSN) 데이터를 찾지 못했습니다.');
       }
     } catch (err: any) {
       setJcrUrlStatus('error');
-      setJcrUrlMessage(err.message || 'Failed to load JCR data');
+      setJcrUrlMessage(err.message || 'JCR 데이터를 로드하지 못했습니다.');
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setJcrUrlStatus('checking');
+    setJcrUrlMessage(`${file.name} 분석 중...`);
+    try {
+      const buffer = await file.arrayBuffer();
+      const map = parseJCRWorkbook(buffer);
+      const count = Object.keys(map).length;
+      if (count > 0) {
+        jcrCache = { url: `local-file:${file.name}`, data: map };
+        setLoadedJournalCount(count);
+        setJcrUrlStatus('success');
+        setJcrUrlMessage(`로컬 파일(${file.name})에서 ${count.toLocaleString()}개 저널을 로드했습니다.`);
+      } else {
+        setJcrUrlStatus('error');
+        setJcrUrlMessage('엑셀 파일에서 Category/ISSN 열 데이터를 찾지 못했습니다.');
+      }
+    } catch (err: any) {
+      setJcrUrlStatus('error');
+      setJcrUrlMessage(`파일 분석 실패: ${err.message || err}`);
+    }
+    // reset input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
   };
   
@@ -370,6 +440,72 @@ export default function App() {
     }
 
     setIsProcessing(false);
+  };
+
+  const deduplicatePapers = (papers: (PaperInfo & { _needsAuthors?: boolean })[]): (PaperInfo & { _needsAuthors?: boolean })[] => {
+    const seenDois = new Set<string>();
+    const seenScopusIds = new Set<string>();
+    const seenTitles = new Set<string>();
+    const seenOther = new Set<string>();
+    const deduplicated: (PaperInfo & { _needsAuthors?: boolean })[] = [];
+
+    for (const paper of papers) {
+      if (paper.status === 'not_found' || paper.status === 'error') {
+        const errKey = `${paper.status}:${paper.id}`;
+        if (!seenOther.has(errKey)) {
+          seenOther.add(errKey);
+          deduplicated.push(paper);
+        }
+        continue;
+      }
+
+      const cleanDoi = paper.doi ? paper.doi.trim().toLowerCase() : '';
+      const scopusId = paper.id && paper.id.startsWith('SCOPUS_ID:') ? paper.id.trim() : '';
+      const normTitle = paper.title && paper.title !== 'Unknown Title' 
+        ? paper.title.toLowerCase().replace(/[^a-z0-9가-힣]/g, '') 
+        : '';
+
+      let isDuplicate = false;
+      let existingIndex = -1;
+
+      if (cleanDoi && seenDois.has(cleanDoi)) {
+        isDuplicate = true;
+        existingIndex = deduplicated.findIndex(p => p.doi && p.doi.trim().toLowerCase() === cleanDoi);
+      } else if (scopusId && seenScopusIds.has(scopusId)) {
+        isDuplicate = true;
+        existingIndex = deduplicated.findIndex(p => p.id && p.id.trim() === scopusId);
+      } else if (normTitle.length >= 8 && seenTitles.has(normTitle)) {
+        isDuplicate = true;
+        existingIndex = deduplicated.findIndex(p => {
+          const otherNorm = p.title ? p.title.toLowerCase().replace(/[^a-z0-9가-힣]/g, '') : '';
+          return otherNorm.length >= 8 && otherNorm === normTitle;
+        });
+      } else if (!cleanDoi && !scopusId && normTitle.length < 8) {
+        const fallbackKey = `${paper.id}:${paper.title}`;
+        if (seenOther.has(fallbackKey)) {
+          isDuplicate = true;
+        } else {
+          seenOther.add(fallbackKey);
+        }
+      }
+
+      if (isDuplicate) {
+        if (existingIndex !== -1) {
+          const existing = deduplicated[existingIndex];
+          if (existing._needsAuthors && !paper._needsAuthors && paper.authors) {
+            existing.authors = paper.authors;
+            existing._needsAuthors = false;
+          }
+        }
+      } else {
+        if (cleanDoi) seenDois.add(cleanDoi);
+        if (scopusId) seenScopusIds.add(scopusId);
+        if (normTitle.length >= 8) seenTitles.add(normTitle);
+        deduplicated.push(paper);
+      }
+    }
+
+    return deduplicated;
   };
 
   const searchScopus = async () => {
@@ -535,6 +671,7 @@ export default function App() {
           combinedResults = [...combinedResults, ...newResults];
         }
         
+        combinedResults = deduplicatePapers(combinedResults);
         setResults([...combinedResults]);
         setProgress({ current: i + 1, total: maxLen });
 
@@ -550,6 +687,7 @@ export default function App() {
           status: 'error',
           errorMsg: error.message
         });
+        combinedResults = deduplicatePapers(combinedResults);
         setResults([...combinedResults]);
         setProgress({ current: i + 1, total: maxLen });
       }
@@ -688,10 +826,10 @@ export default function App() {
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col min-h-[600px]">
               
               {activeTab === 'settings' ? (
-                <div className="flex flex-col gap-4 h-full">
+                <div className="flex flex-col gap-6 h-full">
                   <div>
                     <label className="text-sm font-medium text-gray-700 uppercase tracking-wider mb-2 flex items-center gap-2">
-                      <Settings className="w-4 h-4" />
+                      <Link className="w-4 h-4 text-blue-600" />
                       JCR Excel URL
                     </label>
                     <div className="flex gap-2">
@@ -704,31 +842,79 @@ export default function App() {
                           setJcrUrlStatus('idle');
                           setJcrUrlMessage('');
                         }}
-                        placeholder="https://.../JCR_IMPACTFACTORS.xlsx"
+                        placeholder="https://.../JCR_IMPACTFACTORS.xlsx 또는 Google Drive 링크"
                         className="w-full rounded-xl border border-gray-200 p-3 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
                       />
                       <button
                         onClick={testJcrUrl}
                         disabled={jcrUrlStatus === 'checking'}
-                        className="px-4 py-2 bg-blue-50 text-blue-700 text-sm font-medium rounded-xl hover:bg-blue-100 disabled:opacity-50 transition-colors whitespace-nowrap"
+                        className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-xl hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap flex items-center gap-1.5"
                       >
-                        {jcrUrlStatus === 'checking' ? 'Checking...' : 'Verify URL'}
+                        {jcrUrlStatus === 'checking' ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            확인 중...
+                          </>
+                        ) : (
+                          'Verify URL'
+                        )}
                       </button>
                     </div>
-                    {jcrUrlMessage && (
-                      <div className={`mt-3 p-3 rounded-xl flex items-start gap-2 text-sm ${
-                        jcrUrlStatus === 'success' ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'
-                      }`}>
-                        {jcrUrlStatus === 'success' ? <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" /> : <XCircle className="w-4 h-4 mt-0.5 shrink-0" />}
-                        <span>{jcrUrlMessage}</span>
-                      </div>
-                    )}
-                    <p className="text-xs text-gray-500 mt-3">
-                      URL to an Excel file with JIF Quartiles to determine top journal percentage. 
-                      Must have 'Category', 'ISSN', and 'eISSN' columns. It also supports the new 'JIF Rank' column.
+
+                    <p className="text-xs text-gray-500 mt-2">
+                      Google Drive 공유 링크, 웹 서버 직링크(URL)를 입력하시면 상위 저널 백분위(Top %)를 자동 계산합니다.
                     </p>
                   </div>
-                  
+
+                  <div className="pt-2 border-t border-gray-100">
+                    <label className="text-sm font-medium text-gray-700 uppercase tracking-wider mb-2 flex items-center gap-2">
+                      <Upload className="w-4 h-4 text-emerald-600" />
+                      또는 엑셀 파일 직접 업로드 (.xlsx)
+                    </label>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".xlsx, .xls"
+                      onChange={handleFileUpload}
+                      className="hidden"
+                      id="jcr-file-input"
+                    />
+                    <label
+                      htmlFor="jcr-file-input"
+                      className="flex items-center justify-center gap-2 w-full border-2 border-dashed border-gray-200 hover:border-blue-400 hover:bg-blue-50/30 rounded-xl p-4 text-sm text-gray-600 font-medium cursor-pointer transition-all"
+                    >
+                      <Upload className="w-4 h-4 text-gray-500" />
+                      내 컴퓨터에서 JCR 엑셀 파일 선택
+                    </label>
+                    <p className="text-xs text-gray-400 mt-1.5">
+                      URL 다운로드가 원격 서버에서 차단/삭제된 경우 직접 파일을 업로드해 즉시 사용할 수 있습니다.
+                    </p>
+                  </div>
+
+                  {jcrUrlMessage && (
+                    <div className={`p-3.5 rounded-xl flex items-start gap-2.5 text-sm ${
+                      jcrUrlStatus === 'success' ? 'bg-green-50 text-green-800 border border-green-100' : 'bg-red-50 text-red-800 border border-red-100'
+                    }`}>
+                      {jcrUrlStatus === 'success' ? (
+                        <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-green-600" />
+                      ) : (
+                        <XCircle className="w-4 h-4 mt-0.5 shrink-0 text-red-600" />
+                      )}
+                      <div className="flex-1 text-xs md:text-sm whitespace-pre-wrap">{jcrUrlMessage}</div>
+                    </div>
+                  )}
+
+                  {loadedJournalCount > 0 && (
+                    <div className="p-3 bg-blue-50 rounded-xl text-xs text-blue-700 flex items-center justify-between">
+                      <span>현재 로드된 저널 수:</span>
+                      <span className="font-semibold">{loadedJournalCount.toLocaleString()}개</span>
+                    </div>
+                  )}
+
+                  <div className="text-xs text-gray-500 space-y-1 bg-gray-50 p-3.5 rounded-xl border border-gray-100">
+                    <p className="font-medium text-gray-700">필수 열(Column) 구성 안내:</p>
+                    <p>• 엑셀 파일 내에 'Category', 'ISSN', 'eISSN' 및 'JIF Rank' 열이 포함되어 있어야 합니다.</p>
+                  </div>
                 </div>
               ) : activeTab === 'crossref' ? (
                 <>
@@ -911,7 +1097,7 @@ export default function App() {
                       )}
                       {results.length > 0 && activeTab === 'scopus' && !isProcessing && (
                         <div className="text-xs text-green-600 font-medium bg-green-50 px-3 py-1 rounded-full">
-                          Found {results.length} papers
+                          Found {results.length} papers (중복 제외)
                         </div>
                       )}
                     </>
